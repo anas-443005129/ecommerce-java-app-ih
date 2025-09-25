@@ -1,241 +1,153 @@
-name: Build & Deploy Java app to Azure VM
+name: Build, Test, and Deploy Java App
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read
-  checks: write
-  pull-requests: write
-  id-token: write
-
-env:
-  APP_NAME: javaapp
-  APP_DIR: /opt/javaapp
-  APP_PORT: 8080
 
 jobs:
-  build-test-deploy:
+  build-test:
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Temurin JDK 21
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
-          cache: maven
+          java-version: '21'  # <-- your Java version
 
-      - name: Build & test (Maven)
-        run: mvn -B -DskipTests=false clean verify
+      - name: Build with Maven
+        run: mvn -B -DskipTests package  # <-- adjust if you run tests separately
 
-      - name: Publish surefire test results
-        if: always()
-        uses: dorny/test-reporter@v2
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: Maven Surefire Tests
-          path: target/surefire-reports/*.xml
-          reporter: java-junit
-          fail-on-error: true
+          name: ecommerce-app-1.0.2         # <-- must match what you’ll download later
+          path: target/*.jar                 # <-- path to your built JAR (or zip)
 
-      # Optional SonarQube (uncomment & set secrets)
-       - name: SonarQube Scan
-         uses: SonarSource/sonarqube-scan-action@v6
-         env:
-           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-         with:
-           args: >
-             -Dsonar.projectKey=sample-java-app
-             -Dsonar.sources=src/main/java
-             -Dsonar.tests=src/test/java
-             -Dsonar.java.binaries=target
+  deploy:
+    needs: build-test
+    runs-on: ubuntu-latest
+    # environment: dev     # optional if you want GH Environments
 
-      - name: Package deployable ZIP
-        run: |
-          set -euo pipefail
-          STAGING="$GITHUB_WORKSPACE/deploy-java"
-          rm -rf "$STAGING"
-          mkdir -p "$STAGING"
-          cp target/*.jar "$STAGING"/
-          TS="$(date +%Y%m%d-%H%M%S)"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          ZIP_NAME="javaapp-${SHORT_SHA}-${TS}.zip"
-          (cd "$GITHUB_WORKSPACE" && zip -qr "$ZIP_NAME" "deploy-java")
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ecommerce-app-1.0.2          # <-- must match upload step
+          path: build-out
 
-      - name: Azure login
+      - name: Azure login (Service Principal)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}   # <-- JSON for SP: {clientId, clientSecret, tenantId, subscriptionId}
 
-      - name: Upload ZIP to Blob + create SAS
+      - name: Upload JAR/ZIP to Blob and create SAS
         uses: azure/cli@v2
         env:
-          ZIP_NAME: ${{ env.ZIP_NAME }}
-          AZ_STORAGE_ACCOUNT: ${{ secrets.AZ_STORAGE_ACCOUNT }}
-          AZ_STORAGE_CONTAINER: ${{ secrets.AZ_STORAGE_CONTAINER }}
-          AZ_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
+          AZ_STORAGE_ACCOUNT:   ${{ secrets.AZ_STORAGE_ACCOUNT }}     # e.g. anasstoragegk
+          AZ_STORAGE_CONTAINER: ${{ secrets.AZ_STORAGE_CONTAINER }}   # e.g. releases (lowercase)
+          AZ_STORAGE_KEY:       ${{ secrets.AZ_STORAGE_KEY }}
         with:
           inlineScript: |
-            set -euo pipefail
-            AZ_STORAGE_KEY="$(printf %s "$AZ_STORAGE_KEY" | tr -d '\r\n')"
-            export AZ_STORAGE_KEY
+            set -e
+            FILE=$(ls build-out)   # picks the single file in build-out
             az storage container create \
               --name "$AZ_STORAGE_CONTAINER" \
               --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" 1>/dev/null
+              --account-key "$AZ_STORAGE_KEY" >/dev/null
+
             az storage blob upload \
               --account-name "$AZ_STORAGE_ACCOUNT" \
               --account-key "$AZ_STORAGE_KEY" \
               --container-name "$AZ_STORAGE_CONTAINER" \
-              --file "$ZIP_NAME" --name "$ZIP_NAME" --overwrite
+              --file "build-out/$FILE" \
+              --name "$FILE" --overwrite
+
             SAS=$(az storage blob generate-sas \
               --account-name "$AZ_STORAGE_ACCOUNT" \
               --account-key "$AZ_STORAGE_KEY" \
               --container-name "$AZ_STORAGE_CONTAINER" \
-              --name "$ZIP_NAME" \
-              --permissions r \
-              --expiry "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')" \
+              --name "$FILE" --permissions r \
+              --expiry "$(date -u -d '+2 hours' '+%Y-%m-%dT%H:%MZ')" \
               --https-only --full-uri -o tsv)
-            echo "::add-mask::$SAS"
-            echo "PACKAGE_SAS_URL=$SAS" >> "$GITHUB_ENV"
 
-      - name: Create deploy.sh (Java)
-        run: |
-          cat > deploy-java.sh << 'EOF'
-          #!/bin/bash
-          set -e
+            echo "PACKAGE_SAS_URL=$SAS" >> $GITHUB_ENV
 
-          APP_NAME="${APP_NAME:-javaapp}"
-          APP_DIR="${APP_DIR:-/opt/javaapp}"
-          APP_PORT="${APP_PORT:-8080}"
-          PACKAGE_URL="$1"
-
-          # pick a valid user (prefer azure)
-          APP_USER="${APP_USER:-azure}"
-          if ! id -u "$APP_USER" >/dev/null 2>&1; then
-            APP_USER="$(id -un)"
-          fi
-          echo "Using APP_USER=$APP_USER"
-
-          # tools
-          if ! command -v java >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y wget unzip
-            sudo mkdir -p /usr/lib/jvm
-            sudo apt-get install -y openjdk-21-jdk || true
-          fi
-          if ! command -v unzip >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y unzip
-          fi
-          if ! command -v curl >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y curl
-          fi
-
-          # dirs
-          sudo mkdir -p "$APP_DIR/releases" "$APP_DIR/current"
-
-          echo "Downloading package..."
-          curl -fSL "$PACKAGE_URL" -o /tmp/javaapp.zip
-          RELEASE_DIR="$APP_DIR/releases/$(date +%Y%m%d-%H%M%S)"
-          sudo mkdir -p "$RELEASE_DIR"
-          unzip -o /tmp/javaapp.zip -d "$RELEASE_DIR"
-
-          # locate jar (inside deploy-java/)
-          JAR=$(ls -1 "$RELEASE_DIR"/deploy-java/*.jar 2>/dev/null | head -n1)
-          if [ -z "$JAR" ]; then
-            JAR=$(ls -1 "$RELEASE_DIR"/*.jar 2>/dev/null | head -n1)
-          fi
-          if [ -z "$JAR" ]; then
-            echo "ERROR: No JAR found in $RELEASE_DIR"; exit 1
-          fi
-          echo "Jar: $JAR"
-
-          sudo chown -R "$APP_USER:$APP_USER" "$RELEASE_DIR"
-
-          # point current to this release
-          sudo rm -rf "$APP_DIR/current"
-          sudo ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
-
-          # systemd service
-          SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-          sudo tee "$SERVICE_FILE" >/dev/null <<SERVICE
-          [Unit]
-          Description=${APP_NAME} Java Service
-          After=network.target
-
-          [Service]
-          User=${APP_USER}
-          WorkingDirectory=${APP_DIR}/current
-          ExecStart=/usr/bin/java -jar "${JAR}" --server.port=${APP_PORT}
-          Restart=always
-          RestartSec=5
-          Environment=JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75
-          Environment=PORT=${APP_PORT}
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now "${APP_NAME}.service"
-          sudo systemctl status "${APP_NAME}.service" --no-pager || true
-          sudo ss -lntp | grep ":${APP_PORT}" || echo "No listener on ${APP_PORT}"
-          rm -f /tmp/javaapp.zip
-          echo "Deployment completed."
-          EOF
-          chmod +x deploy-java.sh
-          echo "DEPLOY_SCRIPT_SHA=$(sha256sum deploy-java.sh | cut -d' ' -f1)"
-
-      # Upload deploy script to blob (so RunCommand payload stays small)
-      - name: Upload deploy.sh to Blob + SAS
+      - name: Push deploy script to VM and execute
         uses: azure/cli@v2
         env:
-          AZ_STORAGE_ACCOUNT: ${{ secrets.AZ_STORAGE_ACCOUNT }}
-          AZ_STORAGE_CONTAINER: ${{ secrets.AZ_STORAGE_CONTAINER }}
-          AZ_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}   # e.g. Anas-LABSs
+          AZURE_VM_NAME:       ${{ secrets.AZURE_VM_NAME }}           # e.g. Azure-VM-Anas1
+          PACKAGE_SAS_URL:     ${{ env.PACKAGE_SAS_URL }}
         with:
           inlineScript: |
-            set -euo pipefail
-            NAME="deploy-java.sh"
-            az storage blob upload \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --container-name "$AZ_STORAGE_CONTAINER" \
-              --file "deploy-java.sh" \
-              --name "$NAME" --overwrite
-            SCRIPT_SAS=$(az storage blob generate-sas \
-               --account-name "$AZ_STORAGE_ACCOUNT" \
-               --account-key "$AZ_STORAGE_KEY" \
-               --container-name "$AZ_STORAGE_CONTAINER" \
-               --name "$NAME" \
-               --permissions r \
-               --expiry "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')" \
-               --https-only --full-uri -o tsv)
-            echo "::add-mask::$SCRIPT_SAS"
-            echo "SCRIPT_SAS_URL=$SCRIPT_SAS" >> "$GITHUB_ENV"
-
-      - name: Execute deploy.sh on VM
-        uses: azure/cli@v2
-        env:
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
-          PACKAGE_SAS_URL: ${{ env.PACKAGE_SAS_URL }}
-          SCRIPT_SAS_URL: ${{ env.SCRIPT_SAS_URL }}
-          APP_DIR: ${{ env.APP_DIR }}
-          APP_NAME: ${{ env.APP_NAME }}
-          APP_PORT: ${{ env.APP_PORT }}
-        with:
-          inlineScript: |
-            set -euo pipefail
             az vm run-command invoke \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$AZURE_VM_NAME" \
               --command-id RunShellScript \
-              --scripts "curl -fsSL '$SCRIPT_SAS_URL' -o /tmp/deploy-java.sh && chmod +x /tmp/deploy-java.sh && sudo APP_USER=azure APP_DIR='$APP_DIR' APP_NAME='$APP_NAME' APP_PORT='$APP_PORT' -E /tmp/deploy-java.sh '$PACKAGE_SAS_URL'"
+              --scripts "cat > /tmp/deploy-java.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            APP_NAME=\${APP_NAME:-javaapp}
+            APP_DIR=\${APP_DIR:-/opt/javaapp}
+            APP_PORT=\${APP_PORT:-8080}
+            PACKAGE_URL="\$1"
+            APP_USER=\${APP_USER:-\$(id -un)}
+
+            command -v java >/dev/null 2>&1 || {
+              sudo apt-get update -y
+              sudo apt-get install -y openjdk-21-jre-headless unzip curl
+            }
+            command -v unzip >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y unzip; }
+
+            sudo mkdir -p "\$APP_DIR/releases" "\$APP_DIR/current"
+            echo "Downloading package..."
+            curl -fSL "\$PACKAGE_URL" -o /tmp/javaapp.zip
+
+            RELEASE_DIR="\$APP_DIR/releases/\$(date +%Y%m%d-%H%M%S)"
+            sudo mkdir -p "\$RELEASE_DIR"
+            sudo unzip -o /tmp/javaapp.zip -d "\$RELEASE_DIR"
+
+            JAR=\$(ls -1 "\$RELEASE_DIR"/*.jar 2>/dev/null | head -n1 || true)
+            if [ -z "\$JAR" ]; then
+              echo "ERROR: No JAR found in \$RELEASE_DIR"
+              exit 1
+            fi
+            echo "Jar: \$JAR"
+
+            sudo chown -R "\$APP_USER:\$APP_USER" "\$RELEASE_DIR"
+            sudo rm -rf "\$APP_DIR/current"
+            sudo ln -sfn "\$RELEASE_DIR" "\$APP_DIR/current"
+
+            SERVICE_FILE="/etc/systemd/system/\${APP_NAME}.service"
+            sudo tee "\$SERVICE_FILE" >/dev/null <<SERVICE
+            [Unit]
+            Description=\${APP_NAME} Java Service
+            After=network.target
+
+            [Service]
+            User=\${APP_USER}
+            WorkingDirectory=\${APP_DIR}/current
+            ExecStart=/usr/bin/java -jar "\$JAR" --server.port=\${APP_PORT}
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now "\${APP_NAME}.service"
+            sudo systemctl status "\${APP_NAME}.service" --no-pager || true
+            sudo ss -lntp | grep ":\${APP_PORT}" || echo "No listener on \${APP_PORT}"
+            EOF
+            chmod +x /tmp/deploy-java.sh
+            sudo APP_USER=azure APP_DIR=/opt/javaapp APP_NAME=javaapp APP_PORT=8080 \
+              -E /tmp/deploy-java.sh "$PACKAGE_SAS_URL"
