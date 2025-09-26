@@ -1,0 +1,67 @@
+name: Build, Test, Scan (SonarQube) and Publish Artifacts
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+env:
+  JAVA_VERSION: '21'
+  SONAR_HOST_URL: http://74.248.130.191:9000
+  ARTIFACT_NAME: app-jar
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Build & Test (with coverage)
+        run: mvn -B clean verify
+
+      # --- SonarQube analysis via Maven plugin ---
+      - name: SonarQube Scan (Maven)
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          mvn -B sonar:sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.login="${SONAR_TOKEN}" \
+            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY || github.repository }}" \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+     
+
+      - name: Package (produce runnable JAR)
+        run: mvn -B -DskipTests package
+
+      - name: Find built JAR
+        id: jar
+        run: |
+          JAR=$(ls -1 target/*.jar | head -n1)
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          echo "Using $JAR"
+
+      - name: Upload artifact (JAR)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ steps.jar.outputs.jar }}
+          retention-days: 14
