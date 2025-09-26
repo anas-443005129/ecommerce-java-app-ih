@@ -20,7 +20,6 @@ env:
 jobs:
   build-test-scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,19 +34,15 @@ jobs:
       - name: Build & Test (with coverage)
         run: mvn -B clean verify
 
-      # --- SonarQube analysis via Maven plugin ---
       - name: SonarQube Scan (Maven)
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
+          echo "Using SONAR_HOST_URL=${{ env.SONAR_HOST_URL }}"
           mvn -B sonar:sonar \
-            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
             -Dsonar.login="${SONAR_TOKEN}" \
-            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY || github.repository }}" \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-
-     
 
       - name: Package (produce runnable JAR)
         run: mvn -B -DskipTests package
